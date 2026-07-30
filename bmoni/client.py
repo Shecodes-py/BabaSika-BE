@@ -91,16 +91,12 @@ class BMONIService:
             'email': email or f"{formatted_phone.replace('+', '')}@babasika.com",
             'phoneNumber': formatted_phone,
         }
-        try:
-            result = self._request('POST', endpoint, payload)
-            user_obj = result.get('user', {})
-            bmoni_user_id = user_obj.get('bmoniUserId') or user_obj.get('id') or result.get('bmoniUserId')
-            if bmoni_user_id:
-                return bmoni_user_id
-            return f"bmoni_user_{int(time.time())}"
-        except Exception as e:
-            logger.warning(f"BMONI user creation API call: {e}. Using BMONI Sandbox User Reference.")
-            return f"bmoni_user_{int(time.time())}"
+        result = self._request('POST', endpoint, payload)
+        user_obj = result.get('user', {})
+        bmoni_user_id = user_obj.get('bmoniUserId') or user_obj.get('id') or result.get('bmoniUserId')
+        if not bmoni_user_id:
+            raise RuntimeError(f"BMONI create_user response missing a user id: {result}")
+        return bmoni_user_id
 
     # Step 2: Create managed smart wallet with owner-proof challenge
     def provision_smart_wallet(self, bmoni_user_id, currency='CNGN'):
@@ -121,83 +117,71 @@ class BMONIService:
         acct = Account.create()
         owner_address = acct.address
 
-        try:
-            # 2. Request owner-proof challenge
-            challenge_endpoint = f'/v1/users/{bmoni_user_id}/smart-wallets/owner-proof-challenges'
-            challenge_payload = {
-                'currency': currency,
-                'userOwnerAddress': owner_address,
-            }
-            challenge_result = self._request('POST', challenge_endpoint, challenge_payload)
-            challenge_id = challenge_result.get('challengeId')
-            message_to_sign = challenge_result.get('message', '')
+        # 2. Request owner-proof challenge
+        challenge_endpoint = f'/v1/users/{bmoni_user_id}/smart-wallets/owner-proof-challenges'
+        challenge_payload = {
+            'currency': currency,
+            'userOwnerAddress': owner_address,
+        }
+        challenge_result = self._request('POST', challenge_endpoint, challenge_payload)
+        challenge_id = challenge_result.get('challengeId')
+        message_to_sign = challenge_result.get('message', '')
 
-            # 3. Sign exact challenge message using eth_account
-            encoded_msg = encode_defunct(text=message_to_sign)
-            signed_msg = acct.sign_message(encoded_msg)
-            signature_hex = signed_msg.signature.hex()
-            if not signature_hex.startswith('0x'):
-                signature_hex = '0x' + signature_hex
+        # 3. Sign exact challenge message using eth_account
+        encoded_msg = encode_defunct(text=message_to_sign)
+        signed_msg = acct.sign_message(encoded_msg)
+        signature_hex = signed_msg.signature.hex()
+        if not signature_hex.startswith('0x'):
+            signature_hex = '0x' + signature_hex
 
-            # 4. Create managed smart wallet
-            create_endpoint = f'/v1/users/{bmoni_user_id}/smart-wallets/create-managed'
-            create_payload = {
-                'currency': currency,
-                'userOwnerAddress': owner_address,
-                'ownerProofChallengeId': challenge_id,
-                'ownerProofSignature': signature_hex,
-            }
-            create_result = self._request('POST', create_endpoint, create_payload)
+        # 4. Create managed smart wallet
+        create_endpoint = f'/v1/users/{bmoni_user_id}/smart-wallets/create-managed'
+        create_payload = {
+            'currency': currency,
+            'userOwnerAddress': owner_address,
+            'ownerProofChallengeId': challenge_id,
+            'ownerProofSignature': signature_hex,
+        }
+        create_result = self._request('POST', create_endpoint, create_payload)
 
-            wallet_id = (
-                create_result.get('smartWalletId')
-                or create_result.get('id')
-                or create_result.get('smartWallet', {}).get('id')
-            )
-            wallet_address = (
-                create_result.get('smartWalletAddress')
-                or create_result.get('walletAddress')
-                or create_result.get('address')
-                or create_result.get('smartWallet', {}).get('walletAddress')
-            )
+        wallet_id = (
+            create_result.get('smartWalletId')
+            or create_result.get('id')
+            or create_result.get('smartWallet', {}).get('id')
+        )
+        wallet_address = (
+            create_result.get('smartWalletAddress')
+            or create_result.get('walletAddress')
+            or create_result.get('address')
+            or create_result.get('smartWallet', {}).get('walletAddress')
+        )
 
-            return {
-                'smartWalletId': wallet_id,
-                'smartWalletAddress': wallet_address,
-                'ownerAddress': owner_address,
-            }
-        except Exception as e:
-            logger.warning(f"Smart wallet provisioning API notice: {e}. Returning provisioned CNGN wallet struct.")
-            return {
-                'smartWalletId': f"wallet_{currency.lower()}_{int(time.time()*1000)}",
-                'smartWalletAddress': f"0x{owner_address[2:10]}...{owner_address[-6:]}",
-                'ownerAddress': owner_address,
-            }
+        if not wallet_id:
+            raise RuntimeError(f"BMONI smart wallet creation response missing wallet id: {create_result}")
+
+        return {
+            'smartWalletId': wallet_id,
+            'smartWalletAddress': wallet_address,
+            'ownerAddress': owner_address,
+        }
 
     # Step 3 & 4: Sandbox KYC and Activate Nigerian Rail
     def complete_sandbox_kyc_and_activate_rail(self, bmoni_user_id, wallet_address, wallet_index=0):
-        try:
-            rail_endpoint = f'/v1/users/{bmoni_user_id}/onboarding/start-nigeria'
-            rail_payload = {
-                'bvn': '22222222222',
-                'ngnWalletAddress': wallet_address,
-                'ngnWalletIndex': wallet_index,
-            }
-            rail_result = self._request('POST', rail_endpoint, rail_payload)
+        rail_endpoint = f'/v1/users/{bmoni_user_id}/onboarding/start-nigeria'
+        rail_payload = {
+            'bvn': '22222222222',
+            'ngnWalletAddress': wallet_address,
+            'ngnWalletIndex': wallet_index,
+        }
+        rail_result = self._request('POST', rail_endpoint, rail_payload)
 
-            status_endpoint = f'/v1/users/{bmoni_user_id}/onboarding/status'
-            status_result = self._request('GET', status_endpoint)
+        status_endpoint = f'/v1/users/{bmoni_user_id}/onboarding/status'
+        status_result = self._request('GET', status_endpoint)
 
-            return {
-                'rail_activation': rail_result,
-                'onboarding_status': status_result,
-            }
-        except Exception as e:
-            logger.warning(f"Sandbox KYC activation notice: {e}")
-            return {
-                'rail_activation': {'status': 'SUCCESS'},
-                'onboarding_status': {'status': 'ACTIVE'},
-            }
+        return {
+            'rail_activation': rail_result,
+            'onboarding_status': status_result,
+        }
 
     # Step 5: Read Wallet Data
     def get_account_wallets(self, bmoni_user_id):
@@ -216,16 +200,7 @@ class BMONIService:
     # BVN Lookup
     def bvn_lookup(self, bmoni_user_id, bvn='22222222222'):
         endpoint = f'/v1/users/{bmoni_user_id}/kyc/bvn-lookup/{bvn}'
-        try:
-            return self._request('GET', endpoint)
-        except Exception:
-            return {
-                'verified': True,
-                'bvn': bvn,
-                'firstName': 'Sandbox',
-                'lastName': 'User',
-                'status': 'VERIFIED'
-            }
+        return self._request('GET', endpoint)
 
     # Move Money / Transfers
     def execute_transfer(self, bmoni_user_id, wallet_id, amount, currency='CNGN'):
@@ -235,9 +210,4 @@ class BMONIService:
             'amount': float(amount),
             'currency': currency,
         }
-        try:
-            result = self._request('POST', '/v1/transfers', transfer_payload)
-            return result
-        except Exception as e:
-            logger.info(f"Direct transfer returned status/exception: {e}. Generating BMONI sandbox reference.")
-            return {'id': f'bmoni_tx_{int(time.time()*1000)}', 'status': 'SUCCESS'}
+        return self._request('POST', '/v1/transfers', transfer_payload)

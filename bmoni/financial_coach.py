@@ -1,4 +1,5 @@
 import logging
+import re
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,30 @@ class BabaSikaAIFinancialCoach:
         q_lower = query.lower()
         lang_key = language.lower() if language.lower() in MULTILINGUAL_TRANSLATIONS else 'english'
         dict_trans = MULTILINGUAL_TRANSLATIONS[lang_key]
+
+        # USD Freelance Income Detection Prompt
+        usd_match = re.search(r'\$(\d+(?:\.\d+)?)|\b(\d+)\s*dollars?', q_lower)
+        if ('paid' in q_lower or 'got' in q_lower or 'client' in q_lower or 'freelance' in q_lower) and usd_match:
+            val = float(usd_match.group(1) or usd_match.group(2) or 1200)
+            future = round(val * 0.20, 2)
+            available = round(val - future, 2)
+            answer = (
+                f"Congratulations on your freelance payout of ${val:,.2f}! "
+                f"Based on your USD freelancer savings plan, BabaSika allocates 20% (${future:,.2f}) toward your future micro-pension "
+                f"and leaves 80% (${available:,.2f}) as your available income."
+            )
+            return {
+                'status': 'success',
+                'query': query,
+                'answer': answer,
+                'language': lang_key,
+                'is_safe': True,
+                'usd_allocation': {
+                    'payout': val,
+                    'future_20_percent': future,
+                    'available_80_percent': available,
+                }
+            }
 
         total_saved = float(contingent_balance) + float(retirement_balance)
 

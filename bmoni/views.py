@@ -473,7 +473,15 @@ def bvn_lookup_view(request):
         if user:
             bmoni_user_id = user.bmoni_user_id
 
-    res = bmoni_service.bvn_lookup(bmoni_user_id or 'sandbox_user', bvn)
+    try:
+        res = bmoni_service.bvn_lookup(bmoni_user_id or 'sandbox_user', bvn)
+    except Exception as e:
+        logger.warning(f"BMONI BVN lookup failed for {bmoni_user_id or 'sandbox_user'}: {e}")
+        return Response(
+            {'status': 'error', 'message': 'Could not verify BVN with BMONI right now. Please try again.'},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
     return Response({
         'status': 'success',
         'message': 'BVN verified successfully via BMONI Sandbox KYC.',
