@@ -87,8 +87,22 @@ def unified_register(request):
     existing = UserProfile.objects.filter(phone_number=data['phone_number']).first()
     if existing and existing.onboarding_status == 'ACTIVE':
         return Response(
-            {'status': 'error', 'message': 'Phone number already registered'},
-            status=status.HTTP_409_CONFLICT,
+            {
+                'status': 'success',
+                'message': 'Account already registered.',
+                'data': {
+                    'profile_id': str(existing.profile_id),
+                    'full_name': existing.full_name,
+                    'phone_number': existing.phone_number,
+                    'bmoni_user_id': existing.bmoni_user_id,
+                    'contingent_wallet_id': existing.contingent_smart_wallet_id,
+                    'contingent_wallet_address': existing.contingent_wallet_address,
+                    'retirement_wallet_id': existing.retirement_smart_wallet_id,
+                    'retirement_wallet_address': existing.retirement_wallet_address,
+                    'onboarding_status': existing.onboarding_status,
+                },
+            },
+            status=status.HTTP_200_OK,
         )
 
     if not bmoni_service.api_key:
