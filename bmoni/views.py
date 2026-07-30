@@ -1,17 +1,17 @@
-import json
 import logging
 from decimal import Decimal
 
+from django.db import transaction
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from accounts.models import UserProfile
+from accounts.models import PFA, UserProfile
 from bmoni.client import BMONIService
 from bmoni.serializers import (
-    OnboardBMONISerializer,
     PensionDepositSerializer,
+    UnifiedRegisterSerializer,
     VoiceInputSerializer,
 )
 from payments.models import Ledger, TransactionAudit
@@ -67,20 +67,20 @@ def process_pension_deposit(user, gross_amount):
 
 
 @api_view(['POST'])
-def onboard_user_bmoni(request):
-    serializer = OnboardBMONISerializer(data=request.data)
+def unified_register(request):
+    serializer = UnifiedRegisterSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(
             {'status': 'error', 'message': 'Validation failed', 'errors': serializer.errors},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    try:
-        user = UserProfile.objects.get(profile_id=serializer.validated_data['profile_id'])
-    except UserProfile.DoesNotExist:
+    data = serializer.validated_data
+
+    if UserProfile.objects.filter(phone_number=data['phone_number']).exists():
         return Response(
-            {'status': 'error', 'message': 'Profile not found'},
-            status=status.HTTP_404_NOT_FOUND,
+            {'status': 'error', 'message': 'Phone number already registered'},
+            status=status.HTTP_409_CONFLICT,
         )
 
     if not bmoni_service.api_key:
@@ -89,54 +89,75 @@ def onboard_user_bmoni(request):
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
+    pfa = None
+    if pfa_id := data.get('pfa_id'):
+        pfa = PFA.objects.filter(id=pfa_id, is_active=True).first()
+
+    bvn = data.get('bvn') or '22222222222'
+
     try:
-        bmoni_user_id = bmoni_service.create_user(
-            first_name=user.full_name.split()[0],
-            email=user.email or f'{user.phone_number}@babasika.com',
-            phone_number=user.phone_number,
-        )
-        user.bmoni_user_id = bmoni_user_id
-        user.onboarding_status = 'USER_CREATED'
-        user.save()
+        with transaction.atomic():
+            user = UserProfile.objects.create(
+                full_name=data['full_name'],
+                phone_number=data['phone_number'],
+                email=data.get('email', ''),
+                preferred_language=data.get('preferred_language', 'en'),
+                pfa=pfa,
+                onboarding_status='PROCESSING',
+            )
 
-        contingent_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
-        user.contingent_smart_wallet_id = contingent_wallet['smartWalletId']
-        user.contingent_wallet_address = contingent_wallet['smartWalletAddress']
-        user.onboarding_status = 'WALLETS_PROVISIONED'
-        user.save()
+            bmoni_user_id = bmoni_service.create_user(
+                first_name=user.full_name.split()[0],
+                email=user.email or f'{user.phone_number}@babasika.com',
+                phone_number=user.phone_number,
+            )
+            user.bmoni_user_id = bmoni_user_id
+            user.onboarding_status = 'USER_CREATED'
+            user.save()
 
-        retirement_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
-        user.retirement_smart_wallet_id = retirement_wallet['smartWalletId']
-        user.retirement_wallet_address = retirement_wallet['smartWalletAddress']
-        user.onboarding_status = 'WALLETS_PROVISIONED'
-        user.save()
+            contingent_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
+            user.contingent_smart_wallet_id = contingent_wallet['smartWalletId']
+            user.contingent_wallet_address = contingent_wallet['smartWalletAddress']
+            user.onboarding_status = 'WALLETS_PROVISIONED'
+            user.save()
 
-        kyc_result = bmoni_service.complete_sandbox_kyc_and_activate_rail(
-            bmoni_user_id,
-            contingent_wallet['smartWalletAddress'],
-        )
-        user.onboarding_status = 'ACTIVE'
-        user.save()
+            retirement_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
+            user.retirement_smart_wallet_id = retirement_wallet['smartWalletId']
+            user.retirement_wallet_address = retirement_wallet['smartWalletAddress']
+            user.save()
+
+            bmoni_service.complete_sandbox_kyc_and_activate_rail(
+                bmoni_user_id,
+                contingent_wallet['smartWalletAddress'],
+            )
+            user.onboarding_status = 'ACTIVE'
+            user.save()
 
         return Response(
             {
                 'status': 'success',
-                'message': 'User onboarded to BMONI successfully',
+                'message': 'Account, BMONI smart wallets, and KYC completed successfully.',
                 'data': {
+                    'profile_id': str(user.profile_id),
+                    'full_name': user.full_name,
+                    'phone_number': user.phone_number,
                     'bmoni_user_id': bmoni_user_id,
                     'contingent_wallet_id': contingent_wallet['smartWalletId'],
+                    'contingent_wallet_address': contingent_wallet['smartWalletAddress'],
                     'retirement_wallet_id': retirement_wallet['smartWalletId'],
+                    'retirement_wallet_address': retirement_wallet['smartWalletAddress'],
                     'onboarding_status': user.onboarding_status,
+                    'pfa': {'id': pfa.id, 'name': pfa.name} if pfa else None,
                 },
             },
             status=status.HTTP_201_CREATED,
         )
 
     except Exception as e:
-        logger.error(f"BMONI onboarding failed for {user.profile_id}: {e}")
+        logger.error(f"Unified registration failed: {e}")
         return Response(
-            {'status': 'error', 'message': f'BMONI onboarding failed: {str(e)}'},
-            status=status.HTTP_502_BAD_GATEWAY,
+            {'status': 'error', 'message': f'Registration failed during execution: {str(e)}'},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
 

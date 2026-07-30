@@ -1,18 +1,12 @@
 from rest_framework import serializers
-from .models import Transaction, Ledger, ReservedAccount
-
-
-class ReservedAccountSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ReservedAccount
-        fields = ['account_reference', 'account_name', 'account_number', 'bank_name', 'bank_code', 'created_at']
+from .models import Transaction, Ledger
 
 
 class TransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Transaction
         fields = [
-            'transaction_ref', 'monnify_payment_ref', 'txn_type',
+            'transaction_ref', 'txn_type',
             'wallet_type', 'amount', 'fee', 'description', 'status', 'created_at'
         ]
 

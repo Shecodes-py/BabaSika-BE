@@ -1,8 +1,16 @@
 from rest_framework import serializers
 
 
-class OnboardBMONISerializer(serializers.Serializer):
-    profile_id = serializers.UUIDField()
+class UnifiedRegisterSerializer(serializers.Serializer):
+    full_name = serializers.CharField(max_length=255)
+    phone_number = serializers.CharField(max_length=20)
+    email = serializers.EmailField(required=False, allow_blank=True)
+    preferred_language = serializers.ChoiceField(
+        choices=['en', 'pidgin', 'yoruba', 'hausa', 'igbo'],
+        default='en',
+    )
+    pfa_id = serializers.IntegerField(required=False, allow_null=True)
+    bvn = serializers.CharField(max_length=11, required=False, allow_blank=True)
 
 
 class PensionDepositSerializer(serializers.Serializer):

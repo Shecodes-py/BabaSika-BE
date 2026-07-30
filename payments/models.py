@@ -3,24 +3,6 @@ from django.db import models
 from accounts.models import UserProfile
 
 
-class ReservedAccount(models.Model):
-    profile = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='reserved_accounts')
-    account_reference = models.CharField(max_length=255, unique=True)
-    account_name = models.CharField(max_length=255)
-    account_number = models.CharField(max_length=20)
-    bank_name = models.CharField(max_length=255)
-    bank_code = models.CharField(max_length=10)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        verbose_name = "Reserved Account"
-        verbose_name_plural = "Reserved Accounts"
-
-    def __str__(self):
-        return f"{self.account_number} - {self.account_name}"
-
-
 class Transaction(models.Model):
     TXN_TYPES = [
         ('deposit', 'Deposit'),
@@ -37,7 +19,6 @@ class Transaction(models.Model):
 
     profile = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='transactions')
     transaction_ref = models.CharField(max_length=255, unique=True, default=uuid.uuid4)
-    monnify_payment_ref = models.CharField(max_length=255, blank=True, null=True)
     txn_type = models.CharField(max_length=20, choices=TXN_TYPES)
     wallet_type = models.CharField(max_length=20, choices=WALLET_TYPES, blank=True, null=True)
     amount = models.DecimalField(max_digits=15, decimal_places=2)

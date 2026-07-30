@@ -10,7 +10,7 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-change-me-in-produc
 
 DEBUG = os.getenv('DJANGO_DEBUG', 'True').lower() == 'true'
 
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,babasika-backend.onrender.com').split(',')
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,babasika-be.onrender.com').split(',')
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -23,8 +23,8 @@ INSTALLED_APPS = [
     'corsheaders',
     'accounts',
     'payments',
-    'monnify',
     'bmoni',
+    "bot",
 ]
 
 MIDDLEWARE = [
@@ -126,10 +126,27 @@ REST_FRAMEWORK = {
     ],
 }
 
-MONNIFY_API_KEY = os.getenv('MONNIFY_API_KEY', '')
-MONNIFY_SECRET = os.getenv('MONNIFY_SECRET', '')
-MONNIFY_CONTRACT_CODE = os.getenv('MONNIFY_CONTRACT_CODE', '')
-MONNIFY_BASE_URL = os.getenv('MONNIFY_BASE_URL', 'https://sandbox.monnify.com')
-
 BMONI_BASE_URL = os.getenv('BMONI_BASE_URL', 'https://embedded-dev.bmoni.com')
 BMONI_API_KEY = os.getenv('BMONI_API_KEY', '')
+
+# --- Twilio ---------------------------------------------------------------
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+# Validate that inbound webhook requests genuinely came from Twilio.
+# Turn off locally (e.g. testing with curl/ngrok on http) if needed.
+TWILIO_VALIDATE_SIGNATURE = os.environ.get("TWILIO_VALIDATE_SIGNATURE", "false").lower() == "true"
+
+# --- Speech-to-text provider ------------------------------------------------
+# STT_MOCK_MODE=True returns a canned transcript so the voice-note demo works
+# without an API key. Set to false + provide OPENAI_API_KEY for real Whisper.
+STT_MOCK_MODE = os.environ.get("STT_MOCK_MODE", "true").lower() == "true"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+STT_MOCK_TRANSCRIPT = os.environ.get(
+    "STT_MOCK_TRANSCRIPT",
+    "BabaSika, I made four thousand eight hundred and fifty naira today. Put something aside for me.",
+)
+
+# --- Ledger config ----------------------------------------------------------
+CONTINGENT_SPLIT_PCT = float(os.environ.get("CONTINGENT_SPLIT_PCT", "0.40"))
+RETIREMENT_SPLIT_PCT = float(os.environ.get("RETIREMENT_SPLIT_PCT", "0.60"))

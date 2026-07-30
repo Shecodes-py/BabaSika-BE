@@ -8,16 +8,6 @@ class PFASerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'short_code', 'is_active']
 
 
-class OnboardUserSerializer(serializers.Serializer):
-    full_name = serializers.CharField(max_length=255)
-    phone_number = serializers.CharField(max_length=20)
-    preferred_language = serializers.ChoiceField(
-        choices=['en', 'pidgin', 'yoruba', 'hausa', 'igbo'],
-        default='en'
-    )
-    pfa_id = serializers.IntegerField(required=False, allow_null=True)
-
-
 class UserProfileSerializer(serializers.ModelSerializer):
     pfa = PFASerializer(read_only=True)
 
