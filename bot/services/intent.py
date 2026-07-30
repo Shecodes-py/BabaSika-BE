@@ -1,133 +1,189 @@
-"""Turns free text (from voice transcript or a typed WhatsApp message) into
-a structured intent:
-
-    {"intent": "MAKE_DEPOSIT", "amount": 4850, "confidence": 0.9}
-    {"intent": "CHECK_BALANCE", "amount": None, "confidence": 0.95}
-    {"intent": "UNKNOWN", "amount": None, "confidence": 0.0}
-
-ARCHITECTURAL RULE (per the PRD): this module NEVER calls BMONI and NEVER
-touches a wallet balance. It only returns data. bot/services/ledger.py is
-the sole deterministic decision-maker that acts on that data — see
-process_deposit_intent() in views.py for the handoff.
-
-Two extraction strategies are provided:
-  1. `_extract_rule_based` — regex + word-number parsing. Deterministic,
-     free, and good enough for structured demo phrases. Used by default.
-  2. `_extract_with_llm` — optional call to an LLM for messier phrasing
-     (mixed Pidgin/English, unusual number formats). Enable by setting
-     LLM_INTENT_EXTRACTION=true and ANTHROPIC_API_KEY.
-"""
-import os
 import re
+import logging
+from bmoni.ai_service import AIFinancialEngine
 
-WORD_NUMBERS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
-    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
-    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
-    "hundred": 100, "thousand": 1000,
-}
-
-DEPOSIT_KEYWORDS = ("put aside", "save", "made", "sold", "deposit", "earned", "collected")
-BALANCE_KEYWORDS = ("balance", "how much", "how much i get", "wetin i get")
-
-LLM_ENABLED = os.environ.get("LLM_INTENT_EXTRACTION", "false").lower() == "true"
+logger = logging.getLogger(__name__)
 
 
-def extract_intent(transcript: str) -> dict:
-    transcript = (transcript or "").strip()
-    if not transcript:
-        return {"intent": "UNKNOWN", "amount": None, "confidence": 0.0}
+def extract_intent(transcript: str, language: str = "en") -> dict:
+    """
+    Extracts structured intent for Phase 3 WhatsApp commands.
+    Supported intents:
+      - move_money (or MAKE_DEPOSIT)
+      - check_balance
+      - check_contingent
+      - check_retirement
+      - transaction_history
+      - withdraw
+      - help
+      - unknown
+    The AI returns structured data ONLY — it NEVER authorizes or moves money.
+    """
+    text = (transcript or "").strip()
+    if not text:
+        return {
+            "intent": "unknown",
+            "amount": None,
+            "currency": "NGN",
+            "confidence": 0.0,
+            "raw_text": "",
+        }
 
-    if LLM_ENABLED:
-        try:
-            return _extract_with_llm(transcript)
-        except Exception:
-            pass  # fall through to rule-based as a safety net
+    lower = text.lower()
 
-    return _extract_rule_based(transcript)
+    # Currency safety check ($ vs NGN)
+    if "$" in text or "dollar" in lower or "usd" in lower:
+        return {
+            "intent": "move_money",
+            "amount": None,
+            "currency": "USD",
+            "confidence": 0.9,
+            "raw_text": text,
+            "error": "UNSUPPORTED_CURRENCY",
+        }
 
+    # 1. Help intent
+    if lower in ["help", "menu", "commands", "what can you do", "options"]:
+        return {
+            "intent": "help",
+            "amount": None,
+            "currency": "NGN",
+            "confidence": 1.0,
+            "raw_text": text,
+        }
 
-def _words_to_number(text: str) -> int | None:
-    tokens = re.findall(r"[a-z]+", text.lower())
-    total, current = 0, 0
-    found_any = False
-    for tok in tokens:
-        if tok not in WORD_NUMBERS:
-            continue
-        found_any = True
-        value = WORD_NUMBERS[tok]
-        if value == 100:
-            current = (current or 1) * 100
-        elif value == 1000:
-            total += (current or 1) * 1000
-            current = 0
-        else:
-            current += value
-    total += current
-    return total if found_any else None
+    # 2. Check balance intents
+    if any(kw in lower for kw in ["contingent balance", "emergency balance", "liquid balance"]):
+        return {
+            "intent": "check_contingent",
+            "amount": None,
+            "currency": "NGN",
+            "confidence": 0.95,
+            "raw_text": text,
+        }
 
+    if any(kw in lower for kw in ["retirement balance", "pension balance", "locked balance"]):
+        return {
+            "intent": "check_retirement",
+            "amount": None,
+            "currency": "NGN",
+            "confidence": 0.95,
+            "raw_text": text,
+        }
 
-def _extract_rule_based(transcript: str) -> dict:
-    lower = transcript.lower()
+    if any(kw in lower for kw in ["balance", "how much", "wetin i get", "my money", "total"]):
+        return {
+            "intent": "check_balance",
+            "amount": None,
+            "currency": "NGN",
+            "confidence": 0.95,
+            "raw_text": text,
+        }
 
-    # Amount: prefer an explicit digit amount (₦4,850 / 4850 naira), then
-    # fall back to parsing spelled-out numbers ("four thousand eight
-    # hundred and fifty").
-    amount = None
-    digit_match = re.search(r"[₦#]?\s?([\d][\d,]*)(?:\.\d+)?\s*(?:naira)?", transcript)
-    if digit_match and any(ch.isdigit() for ch in digit_match.group(1)):
-        cleaned = digit_match.group(1).replace(",", "")
-        if cleaned.isdigit() and int(cleaned) > 0:
-            amount = int(cleaned)
+    # 3. Transaction History intent
+    if any(kw in lower for kw in ["transaction", "history", "recent", "statement", "activity"]):
+        return {
+            "intent": "transaction_history",
+            "amount": None,
+            "currency": "NGN",
+            "confidence": 0.95,
+            "raw_text": text,
+        }
 
-    if amount is None:
-        amount = _words_to_number(lower)
-        if amount == 0:
-            amount = None
+    # 4. Withdraw intent
+    if any(kw in lower for kw in ["withdraw", "pull out", "collect emergency"]):
+        amount = _extract_amount(lower)
+        return {
+            "intent": "withdraw",
+            "amount": amount,
+            "currency": "NGN",
+            "confidence": 0.9 if amount else 0.5,
+            "raw_text": text,
+        }
 
-    if any(kw in lower for kw in BALANCE_KEYWORDS):
-        return {"intent": "CHECK_BALANCE", "amount": None, "confidence": 0.9}
+    # 5. Move Money / Deposit intent
+    deposit_kws = ["save", "move", "deposit", "put", "keep", "add", "pension", "waka", "hold"]
+    has_deposit = any(kw in lower for kw in deposit_kws)
+    amount = _extract_amount(lower)
 
-    if amount is not None and any(kw in lower for kw in DEPOSIT_KEYWORDS):
-        return {"intent": "MAKE_DEPOSIT", "amount": amount, "confidence": 0.9}
+    if has_deposit and amount:
+        return {
+            "intent": "move_money",
+            "amount": amount,
+            "currency": "NGN",
+            "confidence": 0.95,
+            "raw_text": text,
+        }
 
-    if amount is not None:
-        # Number mentioned without a clear verb — still likely a deposit,
-        # lower confidence so the webhook can ask for confirmation.
-        return {"intent": "MAKE_DEPOSIT", "amount": amount, "confidence": 0.55}
+    if has_deposit and not amount:
+        return {
+            "intent": "move_money",
+            "amount": None,
+            "currency": "NGN",
+            "confidence": 0.5,
+            "raw_text": text,
+            "ambiguous": True,
+        }
 
-    return {"intent": "UNKNOWN", "amount": None, "confidence": 0.0}
+    if amount:
+        # Number mentioned without clear verb
+        return {
+            "intent": "move_money",
+            "amount": amount,
+            "currency": "NGN",
+            "confidence": 0.6,
+            "raw_text": text,
+        }
 
-
-def _extract_with_llm(transcript: str) -> dict:
-    """Optional LLM-backed extraction for messier phrasing. Requires the
-    `anthropic` package and ANTHROPIC_API_KEY. Kept isolated so a provider
-    outage never breaks the deposit flow — callers fall back to rule-based."""
-    import json
-
-    import anthropic
-
-    client = anthropic.Anthropic()
-    system = (
-        "Extract a structured savings intent from the user's message. "
-        "Respond ONLY with JSON: "
-        '{"intent": "MAKE_DEPOSIT"|"CHECK_BALANCE"|"UNKNOWN", '
-        '"amount": <integer naira amount or null>, "confidence": <0-1 float>}. '
-        "No preamble, no markdown fences."
-    )
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=200,
-        system=system,
-        messages=[{"role": "user", "content": transcript}],
-    )
-    text = "".join(block.text for block in response.content if block.type == "text")
-    data = json.loads(text.strip())
+    # Default to AIFinancialEngine parser fallback
+    parsed = AIFinancialEngine.extract_intent(text, language=language)
     return {
-        "intent": data.get("intent", "UNKNOWN"),
-        "amount": data.get("amount"),
-        "confidence": float(data.get("confidence", 0.0)),
+        "intent": parsed.get("intent", "unknown").lower(),
+        "amount": parsed.get("amount") if parsed.get("amount") > 0 else None,
+        "currency": "NGN",
+        "confidence": parsed.get("confidence", 0.0),
+        "raw_text": text,
     }
+
+
+def _extract_amount(text: str) -> float | None:
+    # 5k / 5.5k format
+    k_match = re.search(r"(\d+(?:\.\d+)?)\s*k\b", text)
+    if k_match:
+        return float(k_match.group(1)) * 1000.0
+
+    # Digits format: ₦500 / 500 naira / 5,000
+    num_match = re.search(r"[₦#]?\s*(\d[\d,]*)(?:\.\d+)?", text)
+    if num_match:
+        clean = num_match.group(1).replace(",", "")
+        try:
+            val = float(clean)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+
+    # Spelled-out English words
+    word_map = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "hundred": 100, "thousand": 1000,
+    }
+    tokens = re.findall(r"[a-z]+", text)
+    if "hundred" in tokens or "thousand" in tokens:
+        total = 0
+        curr = 0
+        for t in tokens:
+            if t in word_map:
+                v = word_map[t]
+                if v == 100:
+                    curr = (curr or 1) * 100
+                elif v == 1000:
+                    total += (curr or 1) * 1000
+                    curr = 0
+                else:
+                    curr += v
+        total += curr
+        if total > 0:
+            return float(total)
+
+    return None

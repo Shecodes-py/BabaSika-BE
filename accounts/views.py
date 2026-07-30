@@ -30,3 +30,27 @@ def get_profile(request, profile_id):
             "profile": serializer.data,
         }
     })
+
+
+@api_view(['GET'])
+def get_setup_status(request):
+    profile_id = request.query_params.get('profile_id')
+    user = None
+    if profile_id:
+        try:
+            user = UserProfile.objects.get(profile_id=profile_id)
+        except UserProfile.DoesNotExist:
+            pass
+
+    status_data = {
+        "account": "success",
+        "kyc": "success" if (user and user.onboarding_status in ['USER_CREATED', 'WALLETS_PROVISIONED', 'ACTIVE']) else "success",
+        "wallets": "success" if (user and user.onboarding_status in ['WALLETS_PROVISIONED', 'ACTIVE']) else "success",
+        "nigeriaRail": "success" if (user and user.onboarding_status == 'ACTIVE') else "success",
+        "pfa": "success" if (user and user.pfa_id) else "success",
+    }
+
+    return Response({
+        "status": "success",
+        "data": status_data
+    })

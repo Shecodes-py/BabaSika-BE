@@ -1,151 +1,175 @@
-"""Conversational onboarding state machine.
-
-Each inbound text message advances the user by exactly one stage. Deliberately
-NOT a form dump — one question at a time, in plain language. Once every field
-is collected we hand off to bmoni_client.register_new_saver() and reply with
-the "you're in" moment from the PRD.
-
-This module returns the WhatsApp reply text; it never sends messages itself
-(views.py owns the actual Twilio response), which keeps it easy to unit test.
-"""
 import re
+import logging
+from django.db import transaction
+from accounts.models import UserProfile, PFA
+from payments.models import Ledger
+from bmoni.client import BMONIService
+from ..models import WhatsAppOnboarding, OnboardingStage
 
-from ..models import Language, OnboardingStage, User
-from . import bmoni_client
+logger = logging.getLogger(__name__)
+bmoni_service = BMONIService()
 
 PFA_OPTIONS = ["ARM Pension", "Stanbic IBTC Pension", "Trustfund Pensions", "Leadway Pensure"]
 
 LANGUAGE_ALIASES = {
-    "english": Language.ENGLISH, "en": Language.ENGLISH,
-    "yoruba": Language.YORUBA, "yo": Language.YORUBA,
-    "hausa": Language.HAUSA, "ha": Language.HAUSA,
-    "igbo": Language.IGBO, "ig": Language.IGBO,
-    "pidgin": Language.PIDGIN, "pcm": Language.PIDGIN,
+    "english": "en", "en": "en",
+    "pidgin": "pidgin", "pcm": "pidgin",
+    "yoruba": "yoruba", "yo": "yoruba",
+    "hausa": "hausa", "ha": "hausa",
+    "igbo": "igbo", "ig": "igbo",
 }
 
 
-def get_or_create_user(phone_number: str) -> tuple[User, bool]:
-    return User.objects.get_or_create(phone_number=phone_number)
+def get_user_by_phone(phone_number: str) -> UserProfile | None:
+    """Look up active UserProfile by E.164 phone number."""
+    clean_phone = phone_number.strip()
+    return UserProfile.objects.filter(phone_number=clean_phone).first()
 
 
-def start_greeting() -> str:
-    return (
-        "Welcome to BabaSika.\n"
-        "I can help you start saving for your future.\n"
-        "You can type or send me a voice note.\n\n"
-        "What should I call you?"
-    )
+def handle_onboarding_message(phone_number: str, body: str) -> str:
+    """
+    Drives conversational onboarding for unregistered WhatsApp phone numbers.
+    Once complete, executes the exact same BMONI registration pipeline as the website.
+    """
+    text = (body or "").strip()
+    onboarding, _ = WhatsAppOnboarding.objects.get_or_create(phone_number=phone_number)
+    stage = onboarding.stage
+
+    if stage == OnboardingStage.NEW:
+        onboarding.stage = OnboardingStage.ASK_NAME
+        onboarding.save(update_fields=["stage"])
+        return (
+            "Welcome to BabaSika! 🌾\n"
+            "I can help you build automatic savings (40% liquid emergency / 60% locked retirement pension).\n\n"
+            "I don't have an account for this phone number yet. Let's create one right here!\n"
+            "First, what is your full name?"
+        )
+
+    if stage == OnboardingStage.ASK_NAME:
+        if not text or len(text) < 2:
+            return "Sorry, I didn't catch that — what is your full name?"
+        onboarding.full_name = text.title()
+        onboarding.stage = OnboardingStage.ASK_EMAIL
+        onboarding.save(update_fields=["full_name", "stage"])
+        return (
+            f"Nice to meet you, {onboarding.full_name.split()[0]}!\n"
+            "What's your email address? (Reply 'skip' if you don't have one)"
+        )
+
+    if stage == OnboardingStage.ASK_EMAIL:
+        if text.lower() != "skip" and not _looks_like_email(text):
+            return "That doesn't look like a valid email address. Mind sending it again or reply 'skip'?"
+        onboarding.email = text.lower() if text.lower() != "skip" else ""
+        onboarding.stage = OnboardingStage.ASK_PFA
+        onboarding.save(update_fields=["email", "stage"])
+        options = "\n".join(f"{i+1}. {name}" for i, name in enumerate(PFA_OPTIONS))
+        return (
+            "Which Pension Fund Administrator (PFA) would you like to use?\n"
+            f"{options}\n0. Pick one for me"
+        )
+
+    if stage == OnboardingStage.ASK_PFA:
+        chosen_pfa = _resolve_pfa_choice(text)
+        onboarding.preferred_pfa = chosen_pfa
+        onboarding.stage = OnboardingStage.ASK_LANGUAGE
+        onboarding.save(update_fields=["preferred_pfa", "stage"])
+        return (
+            "What language do you prefer to speak with me in?\n"
+            "English, Pidgin, Yoruba, Hausa, or Igbo?"
+        )
+
+    if stage == OnboardingStage.ASK_LANGUAGE:
+        lang = LANGUAGE_ALIASES.get(text.lower().strip(), "en")
+        onboarding.preferred_language = lang
+        onboarding.stage = OnboardingStage.PROVISIONING
+        onboarding.save(update_fields=["preferred_language", "stage"])
+        return _execute_unified_bmoni_onboarding(onboarding)
+
+    return "Your onboarding is being processed. Send any message to retry."
 
 
 def _looks_like_email(text: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip()))
 
 
-def _looks_like_nin_bvn(text: str) -> bool:
-    digits = re.sub(r"\D", "", text)
-    return len(digits) in (10, 11)  # BVN is 11 digits, NIN is 11; keep it loose for a demo
-
-
-def handle_onboarding_message(user: User, body: str) -> str:
-    """Advances the onboarding state machine by one step. Returns the reply."""
-    text = (body or "").strip()
-    stage = user.onboarding_stage
-
-    if stage == OnboardingStage.NEW:
-        user.onboarding_stage = OnboardingStage.ASK_NAME
-        user.save(update_fields=["onboarding_stage"])
-        return start_greeting()
-
-    if stage == OnboardingStage.ASK_NAME:
-        if not text:
-            return "Sorry, I didn't catch that — what should I call you?"
-        user.full_name = text.title()
-        user.onboarding_stage = OnboardingStage.ASK_EMAIL
-        user.save(update_fields=["full_name", "onboarding_stage"])
-        return (
-            f"Nice to meet you, {user.display_name}!\n"
-            "What's your email address? (So I can send your statements.)"
-        )
-
-    if stage == OnboardingStage.ASK_EMAIL:
-        if not _looks_like_email(text):
-            return "That doesn't look like a valid email — mind sending it again?"
-        user.email = text.lower()
-        user.onboarding_stage = OnboardingStage.ASK_NIN
-        user.save(update_fields=["email", "onboarding_stage"])
-        return (
-            "Got it. Now I need your NIN or BVN to register your retirement "
-            "account with PenCom — it's just for verification, nothing leaves "
-            "BabaSika."
-        )
-
-    if stage == OnboardingStage.ASK_NIN:
-        if not _looks_like_nin_bvn(text):
-            return "Hmm, that doesn't look like a valid NIN/BVN — it should be 10-11 digits. Try again?"
-        user.nin_bvn = re.sub(r"\D", "", text)
-        user.onboarding_stage = OnboardingStage.ASK_PFA
-        user.save(update_fields=["nin_bvn", "onboarding_stage"])
-        options = "\n".join(f"{i+1}. {name}" for i, name in enumerate(PFA_OPTIONS))
-        return (
-            "Do you already have a Pension Fund Administrator (PFA)? If not, "
-            "here are a few good ones — just reply with a number or name:\n"
-            f"{options}\n0. I don't know, pick one for me"
-        )
-
-    if stage == OnboardingStage.ASK_PFA:
-        chosen = _resolve_pfa_choice(text)
-        user.preferred_pfa = chosen
-        user.onboarding_stage = OnboardingStage.ASK_LANGUAGE
-        user.save(update_fields=["preferred_pfa", "onboarding_stage"])
-        return (
-            "Last thing — what language do you want me to speak with you in? "
-            "English, Yoruba, Hausa, Igbo, or Pidgin?"
-        )
-
-    if stage == OnboardingStage.ASK_LANGUAGE:
-        language = LANGUAGE_ALIASES.get(text.lower().strip())
-        if not language:
-            return "Just so I get it right — English, Yoruba, Hausa, Igbo, or Pidgin?"
-        user.preferred_language = language
-        user.onboarding_stage = OnboardingStage.PROVISIONING
-        user.save(update_fields=["preferred_language", "onboarding_stage"])
-        return _run_registration(user)
-
-    # Already onboarded but somehow routed here — shouldn't normally happen.
-    return "You're already all set up! Send me a voice note anytime to save."
-
-
 def _resolve_pfa_choice(text: str) -> str:
     text = text.strip()
-    if text == "0" or "don't know" in text.lower() or "dont know" in text.lower():
+    if text == "0" or "don't know" in text.lower() or "pick" in text.lower():
         return PFA_OPTIONS[0]
     if text.isdigit() and 1 <= int(text) <= len(PFA_OPTIONS):
         return PFA_OPTIONS[int(text) - 1]
-    return text.title()  # user typed a PFA name we don't have listed — accept as free text
+    return text.title()
 
 
-def _run_registration(user: User) -> str:
-    """Runs the full BMONI orchestration chain and produces the
-    "you're in" message. Synchronous for the hackathon demo; move to a
-    Celery task if BMONI calls get slow in production."""
+def _execute_unified_bmoni_onboarding(onboarding: WhatsAppOnboarding) -> str:
+    """
+    Executes the exact same BMONI onboarding pipeline used by the website:
+    Create User -> Provision Smart Wallets via Owner Proof -> Complete Sandbox KYC -> Activate NGN Rail.
+    """
     try:
-        bmoni_client.register_new_saver(user)
-        user.onboarding_stage = OnboardingStage.ONBOARDED
-        user.save()
-    except bmoni_client.BMONIError:
-        # Leave stage at PROVISIONING so the user can be nudged/retried.
+        with transaction.atomic():
+            pfa = PFA.objects.filter(is_active=True).first()
+
+            user = UserProfile.objects.create(
+                full_name=onboarding.full_name,
+                phone_number=onboarding.phone_number,
+                email=onboarding.email or f"{onboarding.phone_number.replace('+', '')}@babasika.com",
+                preferred_language=onboarding.preferred_language,
+                pfa=pfa,
+                onboarding_status='PROCESSING',
+            )
+
+            # Step 1: Create BMONI user
+            bmoni_user_id = bmoni_service.create_user(
+                first_name=user.full_name.split()[0],
+                email=user.email,
+                phone_number=user.phone_number,
+            )
+            user.bmoni_user_id = bmoni_user_id
+            user.onboarding_status = 'USER_CREATED'
+            user.save()
+
+            # Step 2: Provision Smart Wallets via ECDSA owner proof challenge
+            contingent_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
+            user.contingent_smart_wallet_id = contingent_wallet['smartWalletId']
+            user.contingent_wallet_address = contingent_wallet['smartWalletAddress']
+
+            retirement_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
+            user.retirement_smart_wallet_id = retirement_wallet['smartWalletId']
+            user.retirement_wallet_address = retirement_wallet['smartWalletAddress']
+            user.save()
+
+            # Step 3 & 4: Sandbox KYC & Activate Nigerian NGN Rail
+            bmoni_service.complete_sandbox_kyc_and_activate_rail(
+                bmoni_user_id,
+                contingent_wallet['smartWalletAddress'],
+                wallet_index=0,
+            )
+            user.onboarding_status = 'ACTIVE'
+            user.save()
+
+            # Initialize Ledger
+            Ledger.objects.get_or_create(profile=user)
+
+            onboarding.stage = OnboardingStage.COMPLETED
+            onboarding.save()
+
+        first_name = user.full_name.split()[0]
         return (
-            "I hit a snag registering your account with our banking partner. "
-            "Give me a moment and try sending any message again."
+            f"You're all set, {first_name}! 🎉\n"
+            "Your BabaSika micro-pension account and BMONI smart wallets are ready.\n\n"
+            "Every deposit is split:\n"
+            "• 40% → Liquid Emergency Buffer\n"
+            "• 60% → Locked Retirement Pension\n\n"
+            "Try it now! Send a text or voice note like:\n"
+            "\"save 500 naira\" or \"what's my balance?\""
         )
 
-    return (
-        f"You're in, {user.display_name}.\n"
-        "Your BabaSika account is ready.\n\n"
-        f"Contingent: ₦{user.contingent_balance:,.0f}\n"
-        f"Retirement: ₦{user.retirement_balance:,.0f}\n\n"
-        "When money comes in, BabaSika automatically puts 40% aside for "
-        "emergencies and 60% toward retirement.\n\n"
-        "Try it now — send me a voice note like: "
-        "\"I made 4,850 naira today, put something aside for me.\""
-    )
+    except Exception as e:
+        logger.error(f"WhatsApp unified onboarding failed: {e}")
+        onboarding.stage = OnboardingStage.ASK_LANGUAGE
+        onboarding.save()
+        return (
+            "I hit a snag completing your BMONI account registration. "
+            "Please send any message to try again."
+        )

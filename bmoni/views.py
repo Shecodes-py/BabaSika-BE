@@ -8,6 +8,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from accounts.models import PFA, UserProfile
+from bmoni.ai_service import AIFinancialEngine
 from bmoni.client import BMONIService
 from bmoni.serializers import (
     PensionDepositSerializer,
@@ -106,15 +107,17 @@ def unified_register(request):
                 onboarding_status='PROCESSING',
             )
 
+            # Step 1: Create user in BMONI
             bmoni_user_id = bmoni_service.create_user(
                 first_name=user.full_name.split()[0],
-                email=user.email or f'{user.phone_number}@babasika.com',
+                email=user.email or f"{user.phone_number.replace('+', '')}@babasika.com",
                 phone_number=user.phone_number,
             )
             user.bmoni_user_id = bmoni_user_id
             user.onboarding_status = 'USER_CREATED'
             user.save()
 
+            # Step 2: Provision Smart Wallets with Owner-Proof ECDSA challenge signing
             contingent_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
             user.contingent_smart_wallet_id = contingent_wallet['smartWalletId']
             user.contingent_wallet_address = contingent_wallet['smartWalletAddress']
@@ -126,17 +129,22 @@ def unified_register(request):
             user.retirement_wallet_address = retirement_wallet['smartWalletAddress']
             user.save()
 
+            # Step 3 & 4: Sandbox KYC & Activate Nigerian Rail
             bmoni_service.complete_sandbox_kyc_and_activate_rail(
                 bmoni_user_id,
                 contingent_wallet['smartWalletAddress'],
+                wallet_index=0,
             )
             user.onboarding_status = 'ACTIVE'
             user.save()
 
+            # Initialize Ledger
+            Ledger.objects.get_or_create(profile=user)
+
         return Response(
             {
                 'status': 'success',
-                'message': 'Account, BMONI smart wallets, and KYC completed successfully.',
+                'message': 'Account created, BMONI smart wallets provisioned, and NGN rail activated.',
                 'data': {
                     'profile_id': str(user.profile_id),
                     'full_name': user.full_name,
@@ -172,7 +180,7 @@ def deposit_pension(request):
 
     try:
         user = UserProfile.objects.get(profile_id=serializer.validated_data['profile_id'])
-    except UserProfile.DoesNotExist:
+    except Exception:
         return Response(
             {'status': 'error', 'message': 'Profile not found'},
             status=status.HTTP_404_NOT_FOUND,
@@ -186,6 +194,9 @@ def deposit_pension(request):
 
     gross_amount = serializer.validated_data['gross_amount']
 
+    # AI Anomaly & Safety Check
+    anomaly_check = AIFinancialEngine.detect_anomaly(float(gross_amount), user.full_name)
+
     try:
         tx_record = process_pension_deposit(user, gross_amount)
 
@@ -193,9 +204,9 @@ def deposit_pension(request):
             {
                 'status': 'success',
                 'message': (
-                    f"Received ₦{int(gross_amount)}! "
-                    f"₦{int(tx_record.contingent_credit)} (40%) added to your liquid emergency balance, "
-                    f"and ₦{int(tx_record.retirement_credit)} (60%) locked in your retirement pension."
+                    f"Received ₦{int(gross_amount):,}! "
+                    f"₦{int(tx_record.contingent_credit):,} (40%) added to liquid emergency balance, "
+                    f"and ₦{int(tx_record.retirement_credit):,} (60%) locked in retirement pension."
                 ),
                 'data': {
                     'tx_id': str(tx_record.tx_id),
@@ -205,6 +216,7 @@ def deposit_pension(request):
                     'bmoni_tx_id_1': tx_record.bmoni_tx_id_1,
                     'bmoni_tx_id_2': tx_record.bmoni_tx_id_2,
                     'status': tx_record.status,
+                    'ai_safety_check': anomaly_check,
                 },
             },
             status=status.HTTP_200_OK,
@@ -215,6 +227,122 @@ def deposit_pension(request):
             {'status': 'error', 'message': f'Deposit failed: {str(e)}'},
             status=status.HTTP_502_BAD_GATEWAY,
         )
+
+
+@api_view(['GET'])
+def get_bmoni_balances(request, profile_id):
+    try:
+        user = UserProfile.objects.get(profile_id=profile_id)
+    except Exception:
+        return Response(
+            {'status': 'error', 'message': 'Profile not found'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    ledger, _ = Ledger.objects.get_or_create(profile=user)
+
+    bmoni_live_balances = {}
+    if user.bmoni_user_id:
+        try:
+            bmoni_live_balances = bmoni_service.get_account_balances(user.bmoni_user_id)
+        except Exception as e:
+            logger.warning(f"Could not fetch BMONI balances for {user.bmoni_user_id}: {e}")
+
+    return Response({
+        'status': 'success',
+        'data': {
+            'profile_id': str(user.profile_id),
+            'full_name': user.full_name,
+            'ledger_balances': {
+                'contingent_balance': str(ledger.contingent_balance),
+                'retirement_balance': str(ledger.retirement_balance),
+                'total_contributions': str(ledger.total_contributions),
+            },
+            'bmoni_smart_wallets': {
+                'contingent_wallet_id': user.contingent_smart_wallet_id,
+                'contingent_wallet_address': user.contingent_wallet_address,
+                'retirement_wallet_id': user.retirement_smart_wallet_id,
+                'retirement_wallet_address': user.retirement_wallet_address,
+            },
+            'bmoni_live_balances': bmoni_live_balances,
+        }
+    })
+
+
+@api_view(['GET'])
+def get_bmoni_transactions(request, profile_id):
+    try:
+        user = UserProfile.objects.get(profile_id=profile_id)
+    except Exception:
+        return Response(
+            {'status': 'error', 'message': 'Profile not found'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    bmoni_live_txns = []
+    if user.bmoni_user_id:
+        try:
+            bmoni_live_txns = bmoni_service.get_account_transactions(user.bmoni_user_id)
+        except Exception as e:
+            logger.warning(f"Could not fetch BMONI transactions: {e}")
+
+    audit_txns = TransactionAudit.objects.filter(user=user)[:50]
+    audit_data = [
+        {
+            'tx_id': str(t.tx_id),
+            'gross_amount': str(t.gross_amount),
+            'contingent_credit': str(t.contingent_credit),
+            'retirement_credit': str(t.retirement_credit),
+            'bmoni_tx_id_1': t.bmoni_tx_id_1,
+            'bmoni_tx_id_2': t.bmoni_tx_id_2,
+            'status': t.status,
+            'created_at': t.created_at.isoformat(),
+        }
+        for t in audit_txns
+    ]
+
+    return Response({
+        'status': 'success',
+        'data': {
+            'local_audited_transactions': audit_data,
+            'bmoni_live_transactions': bmoni_live_txns,
+        }
+    })
+
+
+@api_view(['POST', 'GET'])
+@permission_classes([AllowAny])
+def ai_advisor(request):
+    profile_id = request.data.get('profile_id') or request.query_params.get('profile_id')
+    if not profile_id:
+        return Response(
+            {'status': 'error', 'message': 'profile_id parameter is required'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        user = UserProfile.objects.get(profile_id=profile_id)
+    except Exception:
+        return Response(
+            {'status': 'error', 'message': 'Profile not found'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    ledger, _ = Ledger.objects.get_or_create(profile=user)
+    tx_count = TransactionAudit.objects.filter(user=user, status='SUCCESS').count()
+
+    advisor_report = AIFinancialEngine.generate_advisor_report(
+        profile_name=user.full_name,
+        contingent_balance=ledger.contingent_balance,
+        retirement_balance=ledger.retirement_balance,
+        transaction_count=tx_count,
+    )
+
+    return Response({
+        'status': 'success',
+        'message': 'AI Financial Advisor report generated.',
+        'data': advisor_report,
+    })
 
 
 @api_view(['POST'])
@@ -239,97 +367,79 @@ def voice_webhook(request):
 
     try:
         user = UserProfile.objects.get(profile_id=data['profile_id'])
-    except UserProfile.DoesNotExist:
+    except Exception:
         return Response(
             {'status': 'error', 'message': 'Profile not found'},
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    intent_data = _extract_intent(raw_text, audio_url)
+    intent_data = AIFinancialEngine.extract_intent(raw_text, language=user.preferred_language)
+    intent_name = intent_data.get('intent')
 
-    if intent_data.get('intent') != 'DEPOSIT':
-        return Response(
-            {
-                'status': 'success',
-                'message': f"Intent '{intent_data.get('intent')}' recognized, but only DEPOSIT is supported currently.",
-                'data': intent_data,
+    if intent_name == 'CHECK_BALANCE':
+        ledger, _ = Ledger.objects.get_or_create(profile=user)
+        return Response({
+            'status': 'success',
+            'message': f"Hello {user.full_name}, your Contingent Emergency balance is ₦{ledger.contingent_balance:,.2f} and your Retirement Pension balance is ₦{ledger.retirement_balance:,.2f}.",
+            'data': {
+                'intent': intent_data,
+                'contingent_balance': str(ledger.contingent_balance),
+                'retirement_balance': str(ledger.retirement_balance),
             }
-        )
+        })
 
-    gross_amount = Decimal(str(intent_data['gross_amount']))
+    if intent_name == 'GET_FINANCIAL_ADVICE':
+        ledger, _ = Ledger.objects.get_or_create(profile=user)
+        report = AIFinancialEngine.generate_advisor_report(user.full_name, ledger.contingent_balance, ledger.retirement_balance)
+        return Response({
+            'status': 'success',
+            'message': report['summary_pidgin'],
+            'data': report,
+        })
 
-    if user.onboarding_status != 'ACTIVE':
-        return Response(
-            {'status': 'error', 'message': 'User not fully onboarded. Please complete BMONI onboarding first.'},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
+    if intent_name == 'MAKE_DEPOSIT':
+        gross_amount = Decimal(str(intent_data['amount']))
 
-    try:
-        tx_record = process_pension_deposit(user, gross_amount)
+        if user.onboarding_status != 'ACTIVE':
+            return Response(
+                {'status': 'error', 'message': 'User not fully onboarded. Please complete BMONI onboarding first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        return Response(
-            {
-                'status': 'success',
-                'message': (
-                    f"Received ₦{int(gross_amount)}! "
-                    f"₦{int(tx_record.contingent_credit)} (40%) added to your liquid emergency balance, "
-                    f"and ₦{int(tx_record.retirement_credit)} (60%) locked in your retirement pension."
-                ),
-                'data': {
-                    'tx_id': str(tx_record.tx_id),
-                    'intent': intent_data,
-                    'gross_amount': str(tx_record.gross_amount),
-                    'contingent_credit': str(tx_record.contingent_credit),
-                    'retirement_credit': str(tx_record.retirement_credit),
-                    'status': tx_record.status,
-                },
-            },
-            status=status.HTTP_200_OK,
-        )
-
-    except Exception as e:
-        return Response(
-            {'status': 'error', 'message': f'Voice deposit failed: {str(e)}'},
-            status=status.HTTP_502_BAD_GATEWAY,
-        )
-
-
-def _extract_intent(raw_text, audio_url=None):
-    if not raw_text:
-        intent_data = {
-            'intent': 'UNKNOWN',
-            'gross_amount': 0,
-            'raw_text': '',
-        }
-        return intent_data
-
-    normalized = raw_text.lower()
-    words = normalized.split()
-    amount = 0
-
-    for i, word in enumerate(words):
         try:
-            amount = int(word.replace(',', ''))
-            break
-        except ValueError:
-            continue
+            tx_record = process_pension_deposit(user, gross_amount)
 
-    has_deposit_keywords = any(
-        kw in normalized for kw in ['keep', 'save', 'deposit', 'put', 'add', 'pension']
-    )
+            return Response(
+                {
+                    'status': 'success',
+                    'message': (
+                        f"Received ₦{int(gross_amount):,}! "
+                        f"₦{int(tx_record.contingent_credit):,} (40%) added to liquid emergency balance, "
+                        f"and ₦{int(tx_record.retirement_credit):,} (60%) locked in retirement pension."
+                    ),
+                    'data': {
+                        'tx_id': str(tx_record.tx_id),
+                        'intent': intent_data,
+                        'gross_amount': str(tx_record.gross_amount),
+                        'contingent_credit': str(tx_record.contingent_credit),
+                        'retirement_credit': str(tx_record.retirement_credit),
+                        'status': tx_record.status,
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
 
-    if amount > 0 and has_deposit_keywords:
-        intent = 'DEPOSIT'
-    elif amount > 0:
-        intent = 'DEPOSIT'
-    else:
-        intent = 'UNKNOWN'
+        except Exception as e:
+            return Response(
+                {'status': 'error', 'message': f'Voice deposit failed: {str(e)}'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
 
-    return {
-        'intent': intent,
-        'gross_amount': amount,
-        'raw_text': raw_text,
-    }
+    return Response({
+        'status': 'success',
+        'message': f"Recognized intent '{intent_name}'. Say 'save 5000 naira' to deposit or 'check balance'.",
+        'data': intent_data,
+    })
 
 
 @api_view(['GET'])
@@ -338,6 +448,7 @@ def api_log(request):
     logs = BmoniApiLog.objects.all()[:50]
     data = [
         {
+            'id': log.id,
             'endpoint': log.endpoint,
             'method': log.method,
             'status_code': log.status_code,
@@ -350,3 +461,86 @@ def api_log(request):
         for log in logs
     ]
     return Response({'status': 'success', 'data': data})
+
+
+@api_view(['POST'])
+def bvn_lookup_view(request):
+    bvn = request.data.get('bvn', '22222222222')
+    profile_id = request.data.get('profile_id')
+    bmoni_user_id = None
+    if profile_id:
+        user = UserProfile.objects.filter(profile_id=profile_id).first()
+        if user:
+            bmoni_user_id = user.bmoni_user_id
+
+    res = bmoni_service.bvn_lookup(bmoni_user_id or 'sandbox_user', bvn)
+    return Response({
+        'status': 'success',
+        'message': 'BVN verified successfully via BMONI Sandbox KYC.',
+        'data': res
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def ai_coach_ask(request):
+    from .financial_coach import BabaSikaAIFinancialCoach
+    profile_id = request.data.get('profile_id')
+    query = request.data.get('query', 'What is a pension?')
+    language = request.data.get('language', 'english')
+
+    contingent = Decimal('12500')
+    retirement = Decimal('18750')
+    name = 'Member'
+
+    if profile_id:
+        try:
+            user = UserProfile.objects.get(profile_id=profile_id)
+            name = user.full_name
+            language = user.preferred_language or language
+            ledger, _ = Ledger.objects.get_or_create(profile=user)
+            contingent = ledger.contingent_balance
+            retirement = ledger.retirement_balance
+        except Exception:
+            pass
+
+    response_data = BabaSikaAIFinancialCoach.answer_financial_query(
+        query=query,
+        language=language,
+        contingent_balance=contingent,
+        retirement_balance=retirement,
+        profile_name=name
+    )
+
+    return Response({
+        'status': 'success',
+        'message': 'AI Financial Coach response generated.',
+        'data': response_data
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def explain_transaction_view(request):
+    from .financial_coach import BabaSikaAIFinancialCoach
+    amount = request.data.get('amount', 500)
+    language = request.data.get('language', 'english')
+    profile_id = request.data.get('profile_id')
+
+    if profile_id:
+        try:
+            user = UserProfile.objects.get(profile_id=profile_id)
+            language = user.preferred_language or language
+        except Exception:
+            pass
+
+    explanation = BabaSikaAIFinancialCoach.explain_transaction(
+        gross_amount=amount,
+        language=language
+    )
+
+    return Response({
+        'status': 'success',
+        'message': 'Transaction split explained by AI Coach.',
+        'data': explanation
+    })

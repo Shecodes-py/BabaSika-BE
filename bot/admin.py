@@ -1,39 +1,36 @@
 from django.contrib import admin
+from .models import WhatsAppOnboarding, WhatsAppPendingTransaction, InboundMessageLog
 
-from .models import InboundMessageLog, Transaction, User
 
-
-@admin.register(User)
-class UserAdmin(admin.ModelAdmin):
+@admin.register(WhatsAppOnboarding)
+class WhatsAppOnboardingAdmin(admin.ModelAdmin):
     list_display = (
         "phone_number",
         "full_name",
-        "onboarding_stage",
-        "kyc_status",
-        "contingent_balance",
-        "retirement_balance",
+        "stage",
+        "preferred_language",
         "created_at",
     )
-    search_fields = ("phone_number", "full_name", "email", "bmoni_user_id")
-    list_filter = ("onboarding_stage", "kyc_status", "preferred_language")
+    search_fields = ("phone_number", "full_name", "email")
+    list_filter = ("stage", "preferred_language")
 
 
-@admin.register(Transaction)
-class TransactionAdmin(admin.ModelAdmin):
+@admin.register(WhatsAppPendingTransaction)
+class WhatsAppPendingTransactionAdmin(admin.ModelAdmin):
     list_display = (
-        "tx_id",
+        "id",
         "user",
+        "phone_number",
         "gross_amount",
-        "contingent_credit",
-        "retirement_credit",
-        "source",
+        "contingent_amount",
+        "retirement_amount",
         "status",
         "created_at",
     )
-    list_filter = ("source", "status")
-    readonly_fields = [f.name for f in Transaction._meta.fields]
+    list_filter = ("status",)
+    readonly_fields = [f.name for f in WhatsAppPendingTransaction._meta.fields]
 
 
 @admin.register(InboundMessageLog)
 class InboundMessageLogAdmin(admin.ModelAdmin):
-    list_display = ("from_number", "body", "media_content_type", "created_at")
+    list_display = ("from_number", "body", "media_content_type", "processed", "created_at")
