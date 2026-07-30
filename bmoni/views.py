@@ -1,7 +1,6 @@
 import logging
 from decimal import Decimal
 
-from django.db import transaction
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -78,7 +77,8 @@ def unified_register(request):
 
     data = serializer.validated_data
 
-    if UserProfile.objects.filter(phone_number=data['phone_number']).exists():
+    existing = UserProfile.objects.filter(phone_number=data['phone_number']).first()
+    if existing and existing.onboarding_status == 'ACTIVE':
         return Response(
             {'status': 'error', 'message': 'Phone number already registered'},
             status=status.HTTP_409_CONFLICT,
@@ -94,52 +94,57 @@ def unified_register(request):
     if pfa_id := data.get('pfa_id'):
         pfa = PFA.objects.filter(id=pfa_id, is_active=True).first()
 
-    bvn = data.get('bvn') or '22222222222'
-
     try:
-        with transaction.atomic():
-            user = UserProfile.objects.create(
-                full_name=data['full_name'],
-                phone_number=data['phone_number'],
-                email=data.get('email', ''),
-                preferred_language=data.get('preferred_language', 'en'),
-                pfa=pfa,
-                onboarding_status='PROCESSING',
-            )
+        # Resume an incomplete registration instead of restarting it. Retrying
+        # from scratch would call BMONI's create-user endpoint again for a
+        # user it already created there, which BMONI correctly rejects with a
+        # real 409 conflict - so each step below is saved as soon as it
+        # genuinely succeeds, and skipped on retry if already done.
+        user = existing or UserProfile.objects.create(
+            full_name=data['full_name'],
+            phone_number=data['phone_number'],
+            email=data.get('email', ''),
+            preferred_language=data.get('preferred_language', 'en'),
+            pfa=pfa,
+            onboarding_status='PROCESSING',
+        )
 
-            # Step 1: Create user in BMONI
-            bmoni_user_id = bmoni_service.create_user(
+        # Step 1: Create user in BMONI
+        if not user.bmoni_user_id:
+            user.bmoni_user_id = bmoni_service.create_user(
                 first_name=user.full_name.split()[0],
                 email=user.email or f"{user.phone_number.replace('+', '')}@babasika.com",
                 phone_number=user.phone_number,
             )
-            user.bmoni_user_id = bmoni_user_id
             user.onboarding_status = 'USER_CREATED'
             user.save()
 
-            # Step 2: Provision Smart Wallets with Owner-Proof ECDSA challenge signing
-            contingent_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
+        # Step 2: Provision Smart Wallets with Owner-Proof ECDSA challenge signing
+        if not user.contingent_smart_wallet_id:
+            contingent_wallet = bmoni_service.provision_smart_wallet(user.bmoni_user_id, 'CNGN')
             user.contingent_smart_wallet_id = contingent_wallet['smartWalletId']
             user.contingent_wallet_address = contingent_wallet['smartWalletAddress']
             user.onboarding_status = 'WALLETS_PROVISIONED'
             user.save()
 
-            retirement_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
+        if not user.retirement_smart_wallet_id:
+            retirement_wallet = bmoni_service.provision_smart_wallet(user.bmoni_user_id, 'CNGN')
             user.retirement_smart_wallet_id = retirement_wallet['smartWalletId']
             user.retirement_wallet_address = retirement_wallet['smartWalletAddress']
             user.save()
 
-            # Step 3 & 4: Sandbox KYC & Activate Nigerian Rail
+        # Step 3 & 4: Sandbox KYC & Activate Nigerian Rail
+        if user.onboarding_status != 'ACTIVE':
             bmoni_service.complete_sandbox_kyc_and_activate_rail(
-                bmoni_user_id,
-                contingent_wallet['smartWalletAddress'],
+                user.bmoni_user_id,
+                user.contingent_wallet_address,
                 wallet_index=0,
             )
             user.onboarding_status = 'ACTIVE'
             user.save()
 
-            # Initialize Ledger
-            Ledger.objects.get_or_create(profile=user)
+        # Initialize Ledger
+        Ledger.objects.get_or_create(profile=user)
 
         return Response(
             {
@@ -149,13 +154,13 @@ def unified_register(request):
                     'profile_id': str(user.profile_id),
                     'full_name': user.full_name,
                     'phone_number': user.phone_number,
-                    'bmoni_user_id': bmoni_user_id,
-                    'contingent_wallet_id': contingent_wallet['smartWalletId'],
-                    'contingent_wallet_address': contingent_wallet['smartWalletAddress'],
-                    'retirement_wallet_id': retirement_wallet['smartWalletId'],
-                    'retirement_wallet_address': retirement_wallet['smartWalletAddress'],
+                    'bmoni_user_id': user.bmoni_user_id,
+                    'contingent_wallet_id': user.contingent_smart_wallet_id,
+                    'contingent_wallet_address': user.contingent_wallet_address,
+                    'retirement_wallet_id': user.retirement_smart_wallet_id,
+                    'retirement_wallet_address': user.retirement_wallet_address,
                     'onboarding_status': user.onboarding_status,
-                    'pfa': {'id': pfa.id, 'name': pfa.name} if pfa else None,
+                    'pfa': {'id': user.pfa.id, 'name': user.pfa.name} if user.pfa else None,
                 },
             },
             status=status.HTTP_201_CREATED,

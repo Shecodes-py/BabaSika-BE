@@ -1,6 +1,5 @@
 import re
 import logging
-from django.db import transaction
 from accounts.models import UserProfile, PFA
 from payments.models import Ledger
 from bmoni.client import BMONIService
@@ -107,9 +106,14 @@ def _execute_unified_bmoni_onboarding(onboarding: WhatsAppOnboarding) -> str:
     Create User -> Provision Smart Wallets via Owner Proof -> Complete Sandbox KYC -> Activate NGN Rail.
     """
     try:
-        with transaction.atomic():
+        # Resume an incomplete registration instead of restarting it - retrying
+        # from scratch would call BMONI's create-user endpoint again for a user
+        # it already created there, which BMONI correctly rejects with a real
+        # 409 conflict. Each step below is saved as soon as it genuinely
+        # succeeds, and skipped on retry if already done.
+        user = UserProfile.objects.filter(phone_number=onboarding.phone_number).first()
+        if not user:
             pfa = PFA.objects.filter(is_active=True).first()
-
             user = UserProfile.objects.create(
                 full_name=onboarding.full_name,
                 phone_number=onboarding.phone_number,
@@ -119,40 +123,44 @@ def _execute_unified_bmoni_onboarding(onboarding: WhatsAppOnboarding) -> str:
                 onboarding_status='PROCESSING',
             )
 
-            # Step 1: Create BMONI user
-            bmoni_user_id = bmoni_service.create_user(
+        # Step 1: Create BMONI user
+        if not user.bmoni_user_id:
+            user.bmoni_user_id = bmoni_service.create_user(
                 first_name=user.full_name.split()[0],
                 email=user.email,
                 phone_number=user.phone_number,
             )
-            user.bmoni_user_id = bmoni_user_id
             user.onboarding_status = 'USER_CREATED'
             user.save()
 
-            # Step 2: Provision Smart Wallets via ECDSA owner proof challenge
-            contingent_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
+        # Step 2: Provision Smart Wallets via ECDSA owner proof challenge
+        if not user.contingent_smart_wallet_id:
+            contingent_wallet = bmoni_service.provision_smart_wallet(user.bmoni_user_id, 'CNGN')
             user.contingent_smart_wallet_id = contingent_wallet['smartWalletId']
             user.contingent_wallet_address = contingent_wallet['smartWalletAddress']
+            user.save()
 
-            retirement_wallet = bmoni_service.provision_smart_wallet(bmoni_user_id, 'CNGN')
+        if not user.retirement_smart_wallet_id:
+            retirement_wallet = bmoni_service.provision_smart_wallet(user.bmoni_user_id, 'CNGN')
             user.retirement_smart_wallet_id = retirement_wallet['smartWalletId']
             user.retirement_wallet_address = retirement_wallet['smartWalletAddress']
             user.save()
 
-            # Step 3 & 4: Sandbox KYC & Activate Nigerian NGN Rail
+        # Step 3 & 4: Sandbox KYC & Activate Nigerian NGN Rail
+        if user.onboarding_status != 'ACTIVE':
             bmoni_service.complete_sandbox_kyc_and_activate_rail(
-                bmoni_user_id,
-                contingent_wallet['smartWalletAddress'],
+                user.bmoni_user_id,
+                user.contingent_wallet_address,
                 wallet_index=0,
             )
             user.onboarding_status = 'ACTIVE'
             user.save()
 
-            # Initialize Ledger
-            Ledger.objects.get_or_create(profile=user)
+        # Initialize Ledger
+        Ledger.objects.get_or_create(profile=user)
 
-            onboarding.stage = OnboardingStage.COMPLETED
-            onboarding.save()
+        onboarding.stage = OnboardingStage.COMPLETED
+        onboarding.save()
 
         first_name = user.full_name.split()[0]
         return (
