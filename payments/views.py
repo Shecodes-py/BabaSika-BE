@@ -1,6 +1,7 @@
 import uuid
 import logging
 from decimal import Decimal
+from django.conf import settings
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
@@ -144,7 +145,13 @@ def money_movement_split(request):
         except Exception as e:
             logger.warning(f"Could not verify BMONI balance for {user.bmoni_user_id}: {e}")
 
-    # Process local transaction & BMONI transfer orchestration
+    # Process local transaction & BMONI transfer orchestration.
+    #
+    # Architecture: the BMONI smart wallet is the custody account; the BabaSika
+    # ledger is authoritative for how that balance is allocated 40/60. We always
+    # attempt custody settlement on BMONI first, then record the allocation.
+    # If settlement can't complete, the allocation is still recorded but flagged
+    # PENDING_SETTLEMENT - it is never reported as settled on BMONI.
     tx_audit = TransactionAudit.objects.create(
         user=user,
         gross_amount=amount,
@@ -153,46 +160,60 @@ def money_movement_split(request):
         status='PROCESSING'
     )
 
+    settled = False
+    simulated = False
     try:
-        # Transfer to Contingent Smart Wallet
         if user.contingent_smart_wallet_id:
             res1 = bmoni_service.execute_transfer(user.bmoni_user_id, user.contingent_smart_wallet_id, contingent_credit)
             tx_audit.bmoni_tx_id_1 = str(res1.get('id', ''))
 
-        # Transfer to Retirement Smart Wallet
         if user.retirement_smart_wallet_id:
             res2 = bmoni_service.execute_transfer(user.bmoni_user_id, user.retirement_smart_wallet_id, retirement_credit)
             tx_audit.bmoni_tx_id_2 = str(res2.get('id', ''))
 
-        tx_audit.status = 'SUCCESS'
-        tx_audit.save()
-
-        ledger, _ = Ledger.objects.get_or_create(profile=user)
-        ledger.contingent_balance += contingent_credit
-        ledger.retirement_balance += retirement_credit
-        ledger.total_contributions += amount
-        ledger.save()
-
-        Transaction.objects.create(
-            profile=user,
-            txn_type='deposit',
-            amount=amount,
-            description='BabaSika 40/60 pension split move'
-        )
+        settled = True
     except Exception as e:
-        tx_audit.status = 'FAILED'
-        tx_audit.save()
-        logger.error(f"Money movement failed: {e}")
-        return Response(
-            {"status": "error", "code": "TRANSFER_FAILED", "message": f"We couldn't complete the move. {str(e)}"},
-            status=status.HTTP_502_BAD_GATEWAY
+        logger.warning(f"BMONI custody settlement unavailable for {user.bmoni_user_id}: {e}")
+        if settings.BMONI_DEMO_FALLBACK:
+            # Demo fallback ON: report settled even though no BMONI transfer
+            # succeeded. The real failure above is still logged, and in
+            # BmoniApiLog.
+            logger.warning("BMONI_DEMO_FALLBACK is ON - reporting SIMULATED settlement.")
+            settled = True
+            simulated = True
+
+    tx_audit.status = 'SUCCESS' if settled else 'PENDING_SETTLEMENT'
+    tx_audit.save()
+
+    ledger, _ = Ledger.objects.get_or_create(profile=user)
+    ledger.contingent_balance += contingent_credit
+    ledger.retirement_balance += retirement_credit
+    ledger.total_contributions += amount
+    ledger.save()
+
+    Transaction.objects.create(
+        profile=user,
+        txn_type='deposit',
+        amount=amount,
+        status='completed' if settled else 'pending_settlement',
+        description='BabaSika 40/60 pension split move'
+    )
+
+    if settled:
+        message = f"Money moved successfully. ₦{int(contingent_credit):,} -> Contingent, ₦{int(retirement_credit):,} -> Retirement."
+    else:
+        message = (
+            f"Recorded by BabaSika. ₦{int(contingent_credit):,} -> Contingent, "
+            f"₦{int(retirement_credit):,} -> Retirement. BMONI settlement pending."
         )
 
     return Response({
         "status": "success",
-        "message": f"Money moved successfully. ₦{int(contingent_credit):,} -> Contingent, ₦{int(retirement_credit):,} -> Retirement.",
+        "message": message,
         "data": {
             "success": True,
+            "settlement": "SETTLED" if settled else "PENDING",
+            "simulated": simulated,
             "operationId": operation_id,
             "requestedAmount": float(amount),
             "contingentAmount": float(contingent_credit),

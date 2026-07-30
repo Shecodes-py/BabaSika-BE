@@ -193,9 +193,17 @@ class BMONIService:
         return self._request('GET', endpoint)
 
     def get_account_transactions(self, bmoni_user_id, smart_wallet_id=None):
-        endpoint = f'/v1/users/{bmoni_user_id}/smart-wallets/account/transactions'
-        params = {'smartWalletId': smart_wallet_id} if smart_wallet_id else None
-        return self._request('GET', endpoint, params=params)
+        """Transactions are read per smart wallet. BMONI has no account-wide
+        transactions route (.../smart-wallets/account/transactions does not
+        exist - it 400s because 'account' gets parsed as the wallet UUID), so
+        when no wallet is given we read the user's first wallet."""
+        if not smart_wallet_id:
+            wallets = self.get_account_wallets(bmoni_user_id)
+            if not wallets:
+                return {'transactions': [], 'total': 0}
+            smart_wallet_id = wallets[0].get('id')
+        endpoint = f'/v1/users/{bmoni_user_id}/smart-wallets/{smart_wallet_id}/transactions'
+        return self._request('GET', endpoint)
 
     # BVN Lookup
     def bvn_lookup(self, bmoni_user_id, bvn='22222222222'):
@@ -203,11 +211,32 @@ class BMONIService:
         return self._request('GET', endpoint)
 
     # Move Money / Transfers
-    def execute_transfer(self, bmoni_user_id, wallet_id, amount, currency='CNGN'):
-        transfer_payload = {
-            'userId': bmoni_user_id,
-            'walletId': wallet_id,
-            'amount': float(amount),
-            'currency': currency,
+    def execute_transfer(self, bmoni_user_id, wallet_id, amount, from_wallet_id=None, note=None):
+        """Fund a smart wallet from the user's personal wallet.
+
+        Real endpoint: POST /v1/users/{userId}/smart-wallets/fund
+        Body: fromWalletId (personal wallet), groupWalletId (target smart
+        wallet), amount (decimal string), note (optional).
+
+        NOTE: the previously used POST /v1/transfers does not exist on BMONI
+        (404 'Cannot POST /v1/transfers') - it never worked.
+
+        `from_wallet_id` is a BMONI *personal* wallet. Partner-created users
+        have smart wallets only, and the partner API exposes no route to
+        create a personal wallet, so this stays unfunded until BMONI provides
+        a funding source (see audit notes).
+        """
+        if not from_wallet_id:
+            raise ValueError(
+                "BMONI transfer needs a source personal wallet (fromWalletId). "
+                "This user has smart wallets only - no funding source is provisioned yet."
+            )
+
+        payload = {
+            'fromWalletId': from_wallet_id,
+            'groupWalletId': wallet_id,
+            'amount': str(amount),
         }
-        return self._request('POST', '/v1/transfers', transfer_payload)
+        if note:
+            payload['note'] = note
+        return self._request('POST', f'/v1/users/{bmoni_user_id}/smart-wallets/fund', payload)

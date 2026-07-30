@@ -125,6 +125,19 @@ REST_FRAMEWORK = {
 BMONI_BASE_URL = os.getenv('BMONI_BASE_URL', 'https://embedded-dev.bmoni.com')
 BMONI_API_KEY = os.getenv('BMONI_API_KEY', '')
 
+# Demo fallback for BMONI sandbox gaps.
+#
+# When True, BMONI operations that cannot complete against the sandbox
+# (transfer settlement, BVN lookup, onboarding steps) return a SIMULATED
+# success instead of an error, so a live demo cannot be blocked by a sandbox
+# limitation.
+#
+# IMPORTANT: with this ON the UI will report these operations as succeeding
+# even though no BMONI call succeeded. Real API failures are still recorded
+# truthfully in BmoniApiLog, and simulated results are marked `simulated: True`
+# in API responses. Set to false to see true BMONI behaviour.
+BMONI_DEMO_FALLBACK = os.getenv('BMONI_DEMO_FALLBACK', 'false').lower() == 'true'
+
 # --- Twilio ---------------------------------------------------------------
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")

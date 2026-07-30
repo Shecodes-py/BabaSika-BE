@@ -54,6 +54,9 @@ class TransactionAudit(models.Model):
         ('INITIATED', 'Initiated'),
         ('PROCESSING', 'Processing'),
         ('SUCCESS', 'Success'),
+        # Allocation recorded in the BabaSika ledger, but custody settlement on
+        # BMONI has not completed yet (e.g. the wallet has no funding source).
+        ('PENDING_SETTLEMENT', 'Recorded - BMONI settlement pending'),
         ('FAILED', 'Failed'),
     ]
 
